@@ -1,0 +1,19 @@
+body {
+    font-family: "LXGW WenKai", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.content p {
+    line-height: 1.8;
+}
+
+.content code {
+    font-family: "JetBrains Mono", "Fira Code", "Source Code Pro", monospace;
+}
+
+.content pre code {
+    font-size: 0.85em;
+}
+
+.sidebar .sidebar-search {
+    margin-top: 10px;
+}

@@ -1,0 +1,25 @@
+[book]
+title = "Qwen-Agent 框架深度解析"
+authors = ["Qwen-Agent Community"]
+language = "zh-CN"
+description = "从历史脉络到工程实践，渐进式拆解 Qwen-Agent 框架的方方面面"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/QwenLM/Qwen-Agent"
+edit-url-template = "https://github.com/QwenLM/Qwen-Agent/edit/main/docs-book/src/{path}"
+additional-css = ["theme/custom.css"]
+additional-js = ["theme/custom.js"]
+no-section-label = true
+
+[output.html.search]
+enable = true
+use-boolean-and = true
+
+[output.html.fold]
+enable = true
+level = 1
