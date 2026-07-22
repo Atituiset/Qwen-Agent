@@ -17,3 +17,6 @@
   - [消息截断与重试](./07-llm-truncation.md)
 - [08 实战指南](./08-practice.md)
   - [FAQ](./08-faq.md)
+- [09 Memory 机制深度剖析](./09-memory-deep-dive.md)
+  - [关键词生成策略详解](./09-memory-keygen.md)
+  - [分词与检索排序](./09-memory-retrieval.md)
