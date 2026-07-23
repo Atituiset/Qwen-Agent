@@ -1,246 +1,217 @@
 # 01 框架全景：从 Agent 范式到 Qwen-Agent 架构
 
-## 1. Agent 范式的历史演进
+> 这一系列不再抄 README，目标是讲清"为什么这样设计、不那样会怎样、改了会踩什么坑"。本章是骨架级全景，每个层次的下钻见对应后续章节。
 
-### 1.1 从 LLM 到 Agent：为什么需要框架？
+读完应能回答的 7 个判断题：
+1. 加一个新 Agent 应继承谁，必须实现什么？
+2. 加一个新 Tool，三种注册方式哪种适合我？
+3. 加一个新模型后端，要实现哪几个抽象方法？
+4. Agent 的 `run` 和 `_run` 为什么不合并？
+5. `_call_tool` 吞 Exception 回喂 LLM，bug 还是设计？
+6. 何时该用 MCP tool 而不是注册 Tool？
+7. 何时该用 ReAct 而不是 FnCall？
 
-大语言模型（LLM）的核心能力是「根据上下文生成文本」。但现实世界的任务远不止文本生成——需要搜索信息、执行代码、操作数据库、调用 API。于是业界形成了一个共识：
-
-> **Agent = LLM + Tool + Workflow + Memory**
-
-这一等式概括了 Agent 的四大支柱：
-- **LLM**：推理与决策的大脑
-- **Tool**：与外部世界交互的双手
-- **Workflow**：组织思考与行动的流程
-- **Memory**：记住过去、积累知识的存储
-
-### 1.2 时间线：Agent 框架的演进脉络
-
-```
-2023.03 ─── ReAct 论文 (Yao et al.)
-│  提出 Thought→Action→Observation 循环
-│
-2023.03 ─── Toolformer (Schick et al.)
-│  让 LLM 学会自我插入工具调用
-│
-2023.06 ─── OpenAI Function Calling
-│  GPT 系列原生支持结构化函数调用
-│  从此，"Prompt Hack" 走向 "API 标准"
-│
-2023.08 ─── LangChain / AutoGen 等框架爆发
-│  Agent 编排框架成为独立赛道
-│
-2023.09 ─── Qwen-Agent 开源
-│  阿里 Qwen 团队推出，深度绑定 Qwen 模型
-│
-2024.06 ─── OpenAI Structured Output
-│  强化 JSON Schema 约束，提升 FnCall 可靠性
-│
-2024.11 ─── Anthropic MCP 发布
-│  Model Context Protocol 标准化工具接入
-│  从"各自定义 Tool"走向"协议统一"
-│
-2025.03 ─── Qwen3 + QwQ 支持
-│  Qwen-Agent 适配推理模型，支持思考链+FnCall
-│
-2025.05 ─── Qwen3-VL Tool-call
-│  多模态 Agent：视觉+工具联动
-│
-2025.07 ─── Qwen3-Coder + vLLM 原生 FnCall
-│  支持 API 级别的 tool_call 解析
-│
-2026.02 ─── Qwen3.5 + DeepPlanning Benchmark
-│  Qwen-Agent 成为 Qwen Chat 的后端
-```
-
-### 1.3 Qwen-Agent 的定位
-
-Qwen-Agent 在 Agent 框架生态中的独特定位：
-
-| 维度 | LangChain | AutoGen | **Qwen-Agent** |
-|------|-----------|---------|----------------|
-| 核心理念 | 通用编排链 | 多 Agent 对话 | **模型原生能力优先** |
-| Tool 接入 | 自定义接口 | 自定义接口 | **FnCall + MCP 双通道** |
-| 模型绑定 | 模型无关 | 模型无关 | **深度适配 Qwen 系列** |
-| RAG 能力 | 外接向量库 | 外接向量库 | **内置文档解析+混合检索** |
-| 生产验证 | 社区驱动 | 学术驱动 | **Qwen Chat 后端** |
-
-**核心设计哲学**：不过度抽象，让 LLM 的原生 Function Call 能力做主力，框架做胶水和编排。
+完整 11 节深度版：仓库 `docs/01_框架全景.md`。
 
 ---
 
-## 2. 项目结构全景
+## 1. 时间线坐标（不是目录，是判断依据）
 
 ```
-Qwen-Agent/
-├── qwen_agent/                    # 核心框架代码
-│   ├── __init__.py                # 导出 Agent, MultiAgentHub
-│   ├── agent.py                   # Agent 基类 + BasicAgent
-│   ├── settings.py                # 全局配置常量
-│   ├── log.py                     # 日志工具
-│   │
-│   ├── llm/                       # LLM 层：模型接入与消息处理
-│   │   ├── __init__.py            # get_chat_model() 工厂
-│   │   ├── schema.py              # Message, FunctionCall, ContentItem 数据模型
-│   │   ├── base.py                # BaseChatModel 抽象基类
-│   │   ├── function_calling.py    # BaseFnCallModel + FnCall 预处理/后处理
-│   │   ├── oai.py                 # OpenAI 兼容接口
-│   │   ├── qwen_dashscope.py      # 阿里 DashScope 接口
-│   │   └── fncall_prompts/        # 两种 FnCall Prompt 模板
-│   │       ├── base_fncall_prompt.py
-│   │       ├── nous_fncall_prompt.py   # Nous Hermes 格式 (默认，推荐)
-│   │       └── qwen_fncall_prompt.py   # Qwen 原生特殊标记格式
-│   │
-│   ├── tools/                     # Tool 层：工具注册与执行
-│   │   ├── __init__.py            # 导出 TOOL_REGISTRY, BaseTool, MCPManager
-│   │   ├── base.py                # BaseTool + register_tool 装饰器
-│   │   ├── mcp_manager.py         # MCP 协议管理器 (单例)
-│   │   ├── retrieval.py           # RAG 检索工具
-│   │   ├── doc_parser.py          # 文档解析+分块
-│   │   ├── code_interpreter.py    # Docker 沙箱代码执行
-│   │   ├── image_gen.py           # 图片生成
-│   │   └── search_tools/          # 检索子模块
-│   │       ├── keyword_search.py
-│   │       ├── front_page_search.py
-│   │       └── hybrid_search.py
-│   │
-│   ├── memory/                    # Memory 层：记忆与知识管理
-│   │   ├── __init__.py
-│   │   └── memory.py              # Memory Agent (RAG 入口)
-│   │
-│   ├── agents/                    # Agent 层：各种工作流实现
-│   │   ├── fncall_agent.py        # FnCallAgent (FnCall 循环)
-│   │   ├── assistant.py           # Assistant (FnCall + RAG)
-│   │   ├── react_chat.py          # ReActChat (ReAct 格式)
-│   │   ├── router.py              # Router (多 Agent 路由)
-│   │   ├── group_chat.py          # GroupChat (多 Agent 群聊)
-│   │   ├── doc_qa/                # 文档问答 Agent 集群
-│   │   ├── writing/               # 写作 Agent 集群
-│   │   └── keygen_strategies/     # RAG 关键词生成策略
-│   │
-│   ├── multi_agent_hub.py         # 多 Agent 管理基类
-│   └── gui/                       # Gradio Web UI
-│
-├── examples/                      # 官方示例
-├── tests/                         # 测试
-└── docs/                          # 源解析文档
+2023.03 ReAct          Thought→Action→Observation 循环
+2023.03 Toolformer      LLM 自插工具
+2023.06 OpenAI FnCall   JSON 结构化 → "API 标准"
+2023.08 LangChain/AutoGen   框架成独立赛道
+2023.09 Qwen-Agent 开源    深度绑定 Qwen，模型原生能力优先
+2024.06 OpenAI Structured Output  JSON Schema 强约束
+2024.11 Anthropic MCP   tool 接入走向协议统一
+2025.03 Qwen3 + QwQ     推理模型 + FnCall
+2025.05 Qwen3-VL        多模态 Agent
+2025.07 Qwen3-Coder + vLLM 原生 FnCall
+2026.02 Qwen3.5         Qwen Chat 后端
+```
+
+| 维度      | LangChain        | AutoGen          | **Qwen-Agent**                  |
+|-----------|------------------|------------------|---------------------------------|
+| 核心理念  | 通用编排链        | 多 Agent 对话     | **模型原生能力优先**            |
+| Tool 接入 | 自定义接口        | 自定义接口        | **FnCall + MCP 双通道**          |
+| 模型绑定  | 模型无关          | 模型无关          | **深度适配 Qwen 系列**          |
+| RAG 能力 | 外接向量库        | 外接向量库        | **内置文档解析+混合检索**        |
+| 生产验证 | 社区驱动          | 学术驱动          | **Qwen Chat 后端**               |
+
+**核心哲学**：不过度抽象，让 LLM 的原生 Function Call 能力做主力。后面所有"为什么不那样"都从这条推出来。
+
+---
+
+## 2. 三层四类一图
+
+```
+┌─────────────────────────────────────────────┐
+│            Agent 层（编排）                  │
+│   Agent → FnCallAgent → Assistant            │
+│   Agent → ReActChat                          │
+│   Agent → Router / GroupChat                 │
+├─────────────────────────────────────────────┤
+│            LLM 层（推理）                    │
+│   BaseChatModel → BaseFnCallModel            │
+│      → OAI / QwenDashScope / ...             │
+├─────────────────────────────────────────────┤
+│            Tool 层（行动）                   │
+│   BaseTool → 内置 Tool / 自定义 Tool         │
+│   MCPManager → MCP Tool（动态）              │
+└─────────────────────────────────────────────┘
+```
+
+四个核心类，都在本仓库的真实位置：
+
+| 类               | 文件:行              | 关键方法                                  |
+|------------------|----------------------|-------------------------------------------|
+| `Agent`          | `qwen_agent/agent.py:31`   | `run()` / `_run()` / `_call_llm()` / `_call_tool()` / `_init_tool()` |
+| `BaseChatModel`  | `qwen_agent/llm/base.py:61` | `chat()` / `_preprocess_messages()` / `_chat_with_functions()` / `_postprocess_messages()` |
+| `BaseTool`       | `qwen_agent/tools/base.py:109` | `call()` / `_verify_json_format_args()` |
+| `Message`        | `qwen_agent/llm/schema.py:132` | `role` / `content` / `function_call`     |
+
+---
+
+## 3. 设计决策速查（8 项核心，详细的 §2~§8 见扁平版）
+
+| #    | 决策点                            | 替代方案不选的理由                 | 详见扁平版 §N |
+|------|-----------------------------------|------------------------------------|--------------|
+| 1    | `run` 永远不子类重写、`_run` 必须重写 | 子类每次要重复 deepcopy/lang 推断/system 注入 | §2 |
+| 2    | Tool 三入口：BaseTool 实例 / MCP dict / 字符串名 | 覆盖"已构造 / MCP 配置 / registry 快路径"三种实际场景 | §3 |
+| 3    | LLM 支持传 dict 自动工厂路由        | examples 一行起，代价是多 isinstance 判断 | §4 |
+| 4    | 一般 Exception 转 string 回喂 LLM，ToolServiceError 透传 | 让 LLM 自愈小 hiccup，基础设施级故障让 Agent 流停 | §5 |
+| 5    | 三套全局注册表 `ToolRegistry / LLMRegistry / MCPManager` | 进程级 import-time 注册，比 entry_points 简单 | §6 |
+| 6    | 内置 Tool 进程内、MCP Tool 跨进程   | MCP 利于语言/生态复用，代价是 IPC 延迟          | §7 |
+| 7    | FnCall 与 ReAct 双工作流           | 兼容不支持原生 FnCall 的开源模型                | §8 |
+| 8    | Agent 构造时传 system_message，不在 `_run` 内重复注入 | `run` 已注入，子类复注入会变成多 system 行    | §2 |
+
+---
+
+## 4. 数据流：一次 Agent 运行的完整路径
+
+```
+用户 messages
+   │
+   ▼
+Agent.run() (agent.py:78)
+   ├── copy.deepcopy(messages)                       # 防污染
+   ├── 类型推断：dict → Message，默认返回 dict
+   ├── lang 自动推断（has_chinese_messages）
+   ├── system_message 注入逻辑：
+   │     - 没 system 行就 insert(0, ...) 那条
+   │     - 有 system 字符串就拼到前部
+   │     - 有 system list（多模态）就放 ContentItem 前部
+   └── 调 _run(...)
+         │
+         ▼
+   _run（子类实现）：
+   ├── _call_llm → BaseChatModel.chat
+   │     └─ 内部 _preprocess（FnCall 模板注入/消息格式化）
+   │        → _chat_with_functions → _postprocess（→ FunctionCall 对象）
+   ├── _detect_tool（検 LLM 输出含 function_call）
+   ├── _call_tool：
+   │     - ToolServiceError / DocParserError → raise
+   │     - 其他 Exception → 转 string 回喂 LLM
+   └── 循环直到无 function_call → yield response
+```
+
+`Agent.run` 在基类做完所有"对所有 Agent 一致"的事，子类只关心业务流。
+
+---
+
+## 5. 项目结构速览
+
+```
+qwen_agent/
+├── agent.py                # Agent + BasicAgent
+├── settings.py             # 全局默认常量
+├── llm/                    # LLM 抽象 + 多后端
+│   ├── base.py             # BaseChatModel、LLM_REGISTRY
+│   ├── function_calling.py # BaseFnCallModel（FnCall 预/后处理）
+│   ├── oai.py / qwen_dashscope.py
+│   └── fncall_prompts/      # Nous / Qwen 两种 FnCall 模板（见 02 章）
+├── tools/                  # 工具层
+│   ├── base.py             # BaseTool、TOOL_REGISTRY、ToolServiceError
+│   ├── mcp_manager.py      # MCPManager 单例
+│   ├── retrieval.py / doc_parser.py / simple_doc_parser.py / ...
+│   └── search_tools/       # keyword / front_page / hybrid_search
+├── memory/
+│   └── memory.py           # Memory._run（见 09 章）
+├── agents/
+│   ├── fncall_agent.py     # FnCall 循环骨架（FnCallAgent）
+│   ├── assistant.py        # FnCallAgent + RAG = Assistant
+│   ├── react_chat.py       # ReActChat 继承 FnCallAgent，override _run + prompt
+│   ├── router.py / group_chat.py / ...
+│   └── keygen_strategies/  # 4 个 keygen 策略（见 09 章）
+└── multi_agent_hub.py      # MultiAgentHub 基类
 ```
 
 ---
 
-## 3. 核心抽象：三层四类
+## 6. 关键代码片段手册
 
-Qwen-Agent 的核心可以用「三层四类」来概括：
-
-```
-┌──────────────────────────────────────────┐
-│  Agent 层 (编排)                          │
-│    Agent -> FnCallAgent -> Assistant      │
-│    Agent -> ReActChat                    │
-│    Agent -> Router / GroupChat           │
-├──────────────────────────────────────────┤
-│  LLM 层 (推理)                            │
-│    BaseChatModel -> BaseFnCallModel      │
-│      -> OAI / QwenDashScope / ...       │
-├──────────────────────────────────────────┤
-│  Tool 层 (行动)                           │
-│    BaseTool -> 内置 Tool / 自定义 Tool    │
-│    MCPManager -> MCP Tool (动态)         │
-└──────────────────────────────────────────┘
-```
-
-### 3.1 四个核心类
-
-| 类 | 位置 | 职责 | 关键方法 |
-|----|------|------|----------|
-| `Agent` | `agent.py:31` | 编排基类 | `_run()`, `_call_llm()`, `_call_tool()`, `_detect_tool()` |
-| `BaseChatModel` | `llm/base.py:61` | LLM 抽象 | `chat()`, `_preprocess_messages()`, `_postprocess_messages()` |
-| `BaseTool` | `tools/base.py:109` | 工具抽象 | `call()`, `_verify_json_format_args()` |
-| `Message` | `llm/schema.py:132` | 消息模型 | Pydantic BaseModel，含 role/content/function_call |
-
-### 3.2 数据流：一次 Agent 运行的完整路径
-
-```
-用户输入 (messages)
-    │
-    ▼
-Agent.run()              # 消息类型转换 + system_message 注入
-    │
-    ▼
-Agent._run()             # 子类实现的具体工作流
-    │
-    ├──→ _call_llm()     # 调用 LLM
-    │       │
-    │       ▼
-    │   BaseChatModel.chat()
-    │       │
-    │       ├──→ _preprocess_messages()      # FnCall 模板注入/消息格式化
-    │       ├──→ _chat_with_functions()      # 发送到模型 API
-    │       └──→ _postprocess_messages()     # FnCall 输出解析 -> FunctionCall 对象
-    │
-    ├──→ _detect_tool()  # 检测 LLM 输出中是否有函数调用
-    │
-    ├──→ _call_tool()    # 执行工具
-    │       │
-    │       ▼
-    │   BaseTool.call()  # 工具具体逻辑
-    │
-    └──→ 循环 (LLM -> Tool -> LLM -> ...) 直到无工具调用
-    │
-    ▼
-yield response           # 流式返回
-```
-
-### 3.3 注册机制
-
-Qwen-Agent 使用全局注册表模式实现可扩展性：
+### 6.1 注册并使用一个 Tool
 
 ```python
-# 工具注册
-TOOL_REGISTRY = {}  # tools/base.py:24
+from qwen_agent.tools import register_tool, BaseTool
 
-@register_tool('my_tool')  # 装饰器注册
+@register_tool('my_tool')
 class MyTool(BaseTool):
     name = 'my_tool'
-    ...
+    def call(self, params, **kwargs):
+        ...
+```
 
-# LLM 注册
-LLM_REGISTRY = {}  # llm/base.py:32
+### 6.2 起一个最简 Assistant
 
-@register_llm('qwen_dashscope')  # 装饰器注册
-class QwenDashScopeChat(BaseFnCallModel):
-    ...
+```python
+from qwen_agent.agents import Assistant
+agent = Assistant(
+    llm={'model': 'qwen-max', 'api_key': '...'},
+    function_list=['code_interpreter'],
+)
+for rsp in agent.run([{'role': 'user', 'content': 'hi'}]):
+    print(rsp)
+```
 
-# 使用时通过工厂方法获取
-llm = get_chat_model({'model': 'qwen-max', 'model_type': 'qwen_dashscope'})
-tool = TOOL_REGISTRY['code_interpreter'](cfg)
+### 6.3 接一个 MCP server
+
+```python
+mcp_cfg = {
+    'mcpServers': {
+        'filesystem': {
+            'command': 'npx',
+            'args': ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']
+        }
+    }
+}
+agent = Assistant(function_list=[mcp_cfg], llm=cfg)
 ```
 
 ---
 
-## 4. 关键设计决策
+## 7. 改这块代码前的检查清单（详细见扁平版 §10）
 
-### 4.1 为什么 FnCall 而非纯 Prompt？
+- [ ] 新 Agent 子类必须实现 `_run` 返回 `Iterator[List[Message]]`
+- [ ] 新 Agent 子类 `_run` 内不要重复注入 system message
+- [ ] 新 Tool 用 `@register_tool('name')` 装饰，`name` 严格匹配类 attribute
+- [ ] 新 Tool 的 cfg 字段名**不能叫 `mcpServers`**
+- [ ] 新 Tool 异常：希望 LLM 可见 = 普通 Exception；希望立即中断 = `ToolServiceError`
+- [ ] 新模型后端：实现 `chat + _preprocess + _chat_with_functions + _postprocess`
+- [ ] 切换 MCP Tool：评估 20~50ms IPC 延迟对 FnCall 循环点的影响
+- [ ] ReAct 模式：仅当模型不支持原生 FnCall 时选；FnCall 路径效率更高
 
-Qwen-Agent 将 Function Call 作为核心范式，而非像早期框架那样用纯文本 Prompt 拼接工具描述。原因是：
-- **结构化**：JSON 格式的函数调用比正则匹配文本更可靠
-- **并行性**：单次响应可包含多个函数调用
-- **兼容性**：与 OpenAI API、vLLM 等服务端原生兼容
-- **可验证**：JSON Schema 可校验参数合法性
+---
 
-### 4.2 为什么同时支持 Nous 和 Qwen 两种 FnCall 格式？
+## 8. 下一站
 
-- **Nous 格式**（默认）：使用纯文本标记，任何 chat 模型都能用，无需特殊 tokenizer
-- **Qwen 格式**：使用花形特殊标记，需要 Qwen 系列 tokenizer 支持，但提供双语模板和 function_choice 约束
+- 想知道 FnCall 两种 prompt 模板的差异：[02 Function Call](./02-fncall.md)
+- 想知道 BaseTool 的 `call` 内部如何解析 JSON：[03 Tool 系统](./03-tool.md)
+- 想知道 MCPManager 单例的细节：[04 MCP](./04-mcp.md)
+- 想知道 Memory 在 Agent 基类中怎么用：[05 Memory 与 RAG](./05-memory.md)
+- 想知道多 Agent 怎么编排：[06 Agent 编排](./06-agent.md)
+- 想知道 LLM preprocess/postprocess 在做什么：[07 LLM 层](./07-llm.md)
+- 想看一个完整决策权衡版的 Memory 子系统拆解：[09 Memory 机制深度剖析](./09-memory-deep-dive.md)
 
-### 4.3 为什么 Memory 是 Agent？
-
-Memory 继承自 Agent 而非独立模块，因为它内部需要调用 LLM（关键词生成）和 Tool（检索/文档解析），复用 Agent 的基础设施是自然选择。
-
-### 4.4 为什么 MCPManager 是单例？
-
-MCPManager 管理一个全局 asyncio 事件循环线程和所有 MCP 客户端连接。多个实例会导致多个事件循环线程和资源浪费，单例模式确保全局共享。
-
-### 4.5 为什么消息截断是 4 步渐进式？
-
-简单截断会丢失关键上下文。4 步策略按信息重要性递减截断：先截长函数结果（最不重要的细节），再移除中间轮次，再截最近函数结果，最后才截用户/助手文本。始终保留 system message 和最后一轮。
+完。
