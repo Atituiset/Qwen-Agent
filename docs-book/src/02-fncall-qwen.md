@@ -1,104 +1,104 @@
-# Qwen FnCall 模板
+# 02-B Qwen FnCall 模板
 
-> 详见源码：`llm/fncall_prompts/qwen_fncall_prompt.py`
+> 配套 [02 Function Call](./02-fncall.md)。本子页只展开 Qwen 原生模板的 pre/post 细节与平行调用的实现，深度决策与"为什么不那样"见扁平版 `docs/02_Function_Call.md`。
+> 行号基于 `main` 分支；`qwen_fncall_prompt.py` 指 `qwen_agent/llm/fncall_prompts/qwen_fncall_prompt.py`。
 
-## 1. 特殊标记
-
-| 标记 | 含义 | 对应场景 |
-|------|------|----------|
-| `✿FUNCTION✿` | 函数名前缀 | LLM 要调用工具时输出 |
-| `✿ARGS✿` | 参数前缀 | 函数参数开始 |
-| `✿RESULT✿` | 结果前缀 | 工具返回结果 |
-| `✿RETURN✿` | 结束标记 | LLM 不再调用工具，输出最终回答 |
-
-这些标记作为 **stop words** 注入：
+## §1. 特殊标记（行 233-237）
 
 ```python
-FN_STOP_WORDS = ['✿RESULT✿', '✿RETURN✿']  # qwen_fncall_prompt.py:237
+FN_NAME = '✿FUNCTION✿'        # LLM 调工具时输出
+FN_ARGS = '✿ARGS✿'             # 函数参数开始
+FN_RESULT = '✿RESULT✿'         # 工具返回结果
+FN_EXIT = '✿RETURN✿'           # 不再调用工具，输出最终回答
+FN_STOP_WORDS = [FN_RESULT, FN_EXIT]
 ```
 
-模型遇到它们会停止生成，等待系统注入工具结果。
+`✿` 是 Unicode 花形（U+273F），自然文本里几乎不会出现，避免误触发。要求 tokenizer 把这串当单 token 编码——Qwen 系列 tokenizer 原生支持，第三方或裸 BPE tokenizer 不可控。
 
-## 2. 模板变体（4 种）
+`FN_STOP_WORDS` 注入 LLM stop 列表，模型遇到这两个标记会**暂停生成等待系统注入** tool result。
 
-| 模板 | 语言 | 并行 | 用途 |
-|------|------|------|------|
-| `FN_CALL_TEMPLATE['zh']` | 中文 | 顺序 | 中文单次工具调用 |
-| `FN_CALL_TEMPLATE['en']` | 英文 | 顺序 | 英文单次工具调用 |
-| `FN_CALL_TEMPLATE['zh_parallel']` | 中文 | 并行 | 中文多次工具调用 |
-| `FN_CALL_TEMPLATE['en_parallel']` | 英文 | 并行 | 英文多次工具调用 |
-
-### 模板结构
-
-- **INFO 模板**（line 239-249）："You have access to the following tools: {tool_descs}"
-- **FMT 模板**（line 251-273）：顺序格式：`FN_NAME` → `FN_ARGS` → `FN_RESULT` → `FN_EXIT`
-- **FMT_PARA 模板**（line 275-325）：并行格式：N 个工具调用，N 个结果，然后一个 `FN_EXIT`
-
-## 3. 消息转换规则
-
-| 原始消息 | 转换后 |
-|----------|--------|
-| assistant + function_call | `✿FUNCTION✿: name\n✿ARGS✿: arguments` |
-| function (工具结果) | 续接到上一条 assistant：`✿RESULT✿: result\n✿RETURN✿: ` |
-
-### 预处理细节
-
-1. **工具描述生成**（`get_function_description`, line 335）：
-   - 每个函数渲染为 markdown 风格：`### {name_for_human}\n\n{name_for_model}: {description} Parameters: {parameters} {args_format}`
-   - 描述用 `\n\n` 拼接，注入到根据 `lang` + `parallel_function_calls` 选择的模板中
-
-2. **Assistant 消息转换**（line 44-56）：
-   - `function_call` → `✿FUNCTION✿: name\n✿ARGS✿: arguments`
-
-3. **FUNCTION 消息转换**（line 57-70）：
-   - 续接到前一条 assistant 消息：`\n✿RESULT✿: result\n✿RETURN✿: `
-   - 注意 `✿RETURN✿:` 后的空格——在继续生成时会被移除以避免形成单 token
-
-4. **function_choice 约束**（line 96-108）：
-   - 如果 `function_choice` 是具体函数名（非 `'auto'`/`'none'`），追加 `✿FUNCTION✿: {function_choice}` 引导模型
-
-### 后处理细节
-
-- 按 `✿FUNCTION✿:` 标记分割 assistant 文本，提取工具调用
-- 每个调用块按 `✿ARGS✿:` 分割为 name 和 arguments
-- `parallel_function_calls=False` 时只保留第一个函数调用
-- 恢复 `✿RETURN✿: ` 中被移除的空格
-
-## 4. function_choice 支持
-
-与 Nous 格式不同，Qwen 格式**支持约束调用指定函数**：
+## §2. 4 变体模板（行 327-331）
 
 ```python
-# 当 function_choice == 'get_weather' 时，
-# 预处理时在消息末尾追加：
-# "✿FUNCTION✿: get_weather"
-# 引导模型必须调用该函数
+FN_CALL_TEMPLATE = {
+    'zh':          FN_CALL_TEMPLATE_INFO_ZH + '\n\n' + FN_CALL_TEMPLATE_FMT_ZH,
+    'en':          FN_CALL_TEMPLATE_INFO_EN + '\n\n' + FN_CALL_TEMPLATE_INFO_EN,
+    'zh_parallel': FN_CALL_TEMPLATE_INFO_ZH + '\n\n' + FN_CALL_TEMPLATE_FMT_PARA_ZH,
+    'en_parallel': FN_CALL_TEMPLATE_INFO_EN + '\n\n' + FN_CALL_TEMPLATE_FMT_PARA_EN,
+}
 ```
 
-## 5. 独特设计
+preprocess 时按 `lang + ('_parallel' if parallel_function_calls else '')` 选 key（行 75）。双语 + 并行是 Qwen 模板的独有配置。
 
-- **双语模板**：完整的中英文 prompt 支持
-- **花形 Unicode 标记**：`✿...✿` 在自然文本中几乎不会出现，避免误触发
-- **stop word 控制**：`✿RESULT✿` 和 `✿RETURN✿` 作为停止词，让模型停下来等待系统注入结果
+`_parallel` 模板教模型一次性输出多个 `FN_NAME: T1 / FN_ARGS: A1 / FN_NAME: T2 / FN_ARGS: A2 / ... / FN_RESULT: R1 / FN_RESULT: R2 / ...` 这种**链式序列**。`FnCallAgent` 收到后会把所有 function_call 并发执行。
 
-## 6. 辅助函数
+## §3. Pre 处理：function_call → 文本（行 29-110）
 
-| 函数 | 行号 | 功能 |
-|------|------|------|
-| `get_function_description` | 335 | 生成人类可读的工具描述字符串 |
-| `remove_incomplete_special_tokens` | 369 | 流式输出时清除不完整的尾部花形标记 |
-| `remove_trailing_comment_of_fn_args` | 389 | 修复模型在 JSON 参数后输出注释的问题 |
+```
+assistant含 function_call  →  ::FUNCTION:: name
+                               ::ARGS:: arguments
+                               拼到上一条 assistant 末尾（行 78-87）
 
-## 7. 源码索引
+FUNCTION role tool result →  续接到上一条 assistant：
+                              ::RESULT:: result
+                              ::RETURN::       ← 让模型从这里续写最终回复
+                              （行 89-100）
 
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `qwen_fncall_prompt.py` | 24 | `QwenFnCallPrompt` 类 |
-| `qwen_fncall_prompt.py` | 233-237 | 特殊标记常量 |
-| `qwen_fncall_prompt.py` | 239-249 | INFO 模板（中英文） |
-| `qwen_fncall_prompt.py` | 251-273 | FMT 模板（顺序，中英文） |
-| `qwen_fncall_prompt.py` | 275-325 | FMT_PARA 模板（并行，中英文） |
-| `qwen_fncall_prompt.py` | 327 | `FN_CALL_TEMPLATE` (4 变体) |
-| `qwen_fncall_prompt.py` | 335 | `get_function_description` |
-| `qwen_fncall_prompt.py` | 369 | `remove_incomplete_special_tokens` |
-| `qwen_fncall_prompt.py` | 389 | `remove_trailing_comment_of_fn_args` |
+function_choice != 'auto'/'none' → 在 last user message 后追加
+                                     ::FUNCTION:: <指定函数名>   （行 95-107）
+```
+
+注意：Qwen 模板里 tool result 是**续接到上一条 assistant**（不是新起 USER message），这与 Nous 完全不同——输出序列更接近模型在 training corpus 里见过的形式。
+
+`function_choice` 强引导在 prompt 层是把前缀拼到最末消息，**靠 stop word 兜底**：模型若输出了 `✿FUNCTION✿: X` 但想反悔不调，需要先 emit `✿RESULT✿` 或 `✿RETURN✿`——但若模型想"反悔"通常不 emit 这俩，会卡循环。
+
+## §4. Post 处理：解析 ✿FUNCTION✿ 等标记
+
+关键步骤：
+1. SYSTEM/USER 消息 append 保留
+2. assistant content 含 `FN_NAME` → 提取 name 与 arguments
+3. function_choice != 'auto'/'none' → 在 assistant 输出前 prepend `FN_NAME: function_choice\n`（行 119-125）
+4. 移除尾部 `FN_RESULT` / `FN_EXIT` 等不闭合的特殊 token（`remove_incomplete_special_tokens`，行 369）
+5. 重建 `FunctionCall` 对象放到 `message.function_call`
+
+`remove_trailing_comment_of_fn_args`（行 389）会**移除 arguments 中的尾部注释**——Qwen3 推理模型有时会在 arguments JSON 后写一段说明，post 抹掉这部分防 JSON parse 报错。
+
+## §5. 与 Nous 完全不互通的差异
+
+| 维度                  | 实现差异                                                    |
+|----------------------|--------------------------------------------------------------|
+| 标记                  | Unicode `✿FUNCTION✿` vs 文本 `[TOOL_CALL]` — 同一 string 互不识别              |
+| tool result role      | Qwen 续接上一 assistant；Nous 包 user `<tool_result>` tag    |
+| function_choice       | Qwen 行 todo，写入 last user message；Nous raise NotImplementedError |
+| thought 处理          | Qwen 靠 stop word 自动停；Nous 显式分离 `` tag  |
+| SPECIAL_CODE_MODE     | Qwen 无 path；Nous 有专门 code_interpreter code 提外层 path |
+| 模板变体              | Qwen 4 变体跨 lang/parallel；Nous 仅 2 变体（含 WITH_CI）       |
+
+两模板**共用同一 BaseFnCallModel 实例**——LLM cfg 里指定 fncall_prompt_type 后，所有调用都走那一套 pre/post。不能在 history 中混合用两种模板的输出。
+
+## §6. Qwen 模板踩坑速查
+
+- `✿` Unicode 在不支持该 token 的 tokenizer 上会分解为多 token，模型可能根本识别不出标记
+- `function_choice` 只强引导 name 不强引导 arguments；模型输出 `✿FUNCTION✿: get_weather` 后照样可能错参数
+- 用 Qwen 模板时**不支持**Code Interpreter code 提外层 path —— 代码全塞 JSON arguments 转义
+- 模板 prompt 中教的"图片需要渲染为 ![](url)" 是中文场景特别强引导，模型偶发把 tool result 当图像 url
+- `remove_incomplete_special_tokens` 移除半截 `✿` 字符，**若模型生成的 tool name 包含 ✿** 会破坏 prompt
+- `parallel_function_calls=False` 但模型仍并行输出 → postprocess 仍按 parallel 路径处理（无强约束），caller 要警觉
+- Qwen3-Coder + vLLM 0.6+ 原生支持 OpenAI tool_calls 字段时可以**完全跳过 Qwen 模板**走 OAI 直连——Qwen 文本模板是兼容层，不是性能路径
+
+## §7. 关键源码索引
+
+| 行号     | 内容                                       |
+|----------|--------------------------------------------|
+| 24       | `QwenFnCallPrompt` 类定义                  |
+| 75       | `FN_CALL_TEMPLATE[lang + ('_parallel'...)]` 选变体 |
+| 95-107   | function_choice 强引导：last user message 追加 `✿FUNCTION✿: <name>` |
+| 119-125  | function_choice postprocess：prepend 到 assistant 输出 |
+| 157      | FN_STOP_WORDS 注入 stop                    |
+| 233-237  | 特殊标记常量                               |
+| 327-331  | 4 变体 dict                                |
+| 335      | `get_function_description` 单工具描述生成  |
+| 369      | `remove_incomplete_special_tokens`         |
+| 389      | `remove_trailing_comment_of_fn_args`       |
+
+完。

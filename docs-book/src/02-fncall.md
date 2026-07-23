@@ -1,154 +1,157 @@
 # 02 Function Call：让 LLM 学会使用工具
 
-## 1. 历史脉络：从 Prompt Hack 到 API 标准
+> 这一系列讲"为什么这样设计、不那样会怎样、改了会踩什么坑"。本章只回答 FnCall 模板的选型与运行机制。完整深度版见仓库 `docs/02_Function_Call.md`。
 
-### 1.1 前函数调用时代（2023 年之前）
-
-早期的工具使用完全依赖 Prompt 工程：
-
-```
-你可以使用以下工具：
-1. 天气查询：输入城市名，返回天气
-2. 计算器：输入表达式，返回结果
-
-请用以下格式调用工具：
-Action: 工具名
-Action Input: 工具参数
-```
-
-这种方式的问题：
-- LLM 经常格式错乱（缺少换行、多余空格等）
-- 无法并行调用多个工具
-- 需要复杂的正则/字符串匹配来解析输出
-- 不同模型的格式差异大
-
-### 1.2 OpenAI Function Calling（2023.06）
-
-OpenAI 在 Chat Completions API 中引入了 `functions` 参数和结构化的函数调用输出：
-
-```json
-{
-  "role": "assistant",
-  "content": null,
-  "function_call": {
-    "name": "get_weather",
-    "arguments": "{\"location\": \"Beijing\"}"
-  }
-}
-```
-
-这是范式转变——从「让模型模仿文本格式」到「模型原生输出结构化调用」。但有一个问题：**只有 OpenAI 的 API 支持这种格式**。
-
-### 1.3 社区标准化之路
-
-为了让开源模型也能支持函数调用，社区形成了多种方案：
-
-| 方案 | 代表 | 格式 | 特点 |
-|------|------|------|------|
-| Hermes/Nous | NousResearch | `[TOOL_CALL]{"name":...,"arguments":...}[TOOL_END]` | 纯文本标记，模型内嵌 |
-| Qwen 原生 | Qwen 团队 | `✿FUNCTION✿: name ✿ARGS✿: args` | 花形特殊标记，双语模板 |
-| vLLM 原生 | vLLM 社区 | OpenAI 兼容 `tool_calls` 格式 | 服务端解析，API 级别 |
-| GLM | 智谱 | `<|tool_call_block|>` | XML 风格标记 |
-
-Qwen-Agent 同时支持 Nous 和 Qwen 两种格式，通过 `fncall_prompt_type` 配置切换。
+读完应能回答的 7 个判断题：
+1. Nous 与 Qwen 两种模板，哪个不依赖 tokenizer 特殊标记？→ Nous
+2. vLLM 部署 Qwen2.5-Instruct 走哪条？→ Nous
+3. Qwen3 推理模型的 thought 怎么在 Nous 路径分离？→ `<tag>thought</tag>` 包裹，postprocess 切割
+4. Code Interpreter 的代码为什么不直接放 JSON arguments？→ 转义地狱让 JSON parse 易碎
+5. `function_choice='get_weather'` 哪个模板支持？→ Qwen，靠把 `✿FUNCTION✿: get_weather` 追加到末消息末尾强引导
+6. 历史 `function_call` 字段怎么转回 LLM 可见文本？→ preprocess 文本化注入 system/user
+7. 多函数并行调用时 prompt 怎么教？→ Qwen 有 `zh_parallel` / `en_parallel` 4 变体
 
 ---
 
-## 2. Qwen-Agent 的 FnCall 架构
+## 1. 关键定位
 
-### 2.1 类层次
+Qwen-Agent 同时保留两种 FnCall 模板，二者均非 OpenAI `function_call` 字段协议——**都是纯文本 prompt + 后处理 parse 路径**。这是为兼容不支持原生 FnCall 的开源模型而作的取舍，代价是维护两套互不兼容的 prompt 与 postprocess 逻辑。
 
-```
-BaseChatModel (llm/base.py:61)
-  └── BaseFnCallModel (llm/function_calling.py:23)  ← FnCall 核心逻辑
-        ├── OAI (llm/oai.py)                        ← OpenAI 兼容接口
-        └── QwenDashScope (llm/qwen_dashscope.py)  ← 阿里 DashScope 接口
-```
+| 模板   | 类文件                                          | 默认 |
+|--------|-------------------------------------------------|------|
+| Nous   | `fncall_prompts/nous_fncall_prompt.py:27`        | ✅    |
+| Qwen   | `fncall_prompts/qwen_fncall_prompt.py:24`        | 否    |
+| 共同基类 | `fncall_prompts/base_fncall_prompt.py:21`      | —    |
 
-### 2.2 FnCall 预处理与后处理流程
+切换：`generate_cfg={'fncall_prompt_type': 'nous'|'qwen'}`。
 
-```
-原始消息 (Message 列表)
-    │
-    ▼
-BaseFnCallModel._preprocess_messages()    ← function_calling.py:41
-    │
-    ├── 1. super()._preprocess_messages()  ← 多模态格式化 (BaseChatModel)
-    │
-    ├── 2. self.fncall_prompt.preprocess_fncall_messages()
-    │       ├── 将 functions 列表注入 system prompt
-    │       ├── 将 assistant 的 function_call 转为纯文本标记
-    │       └── 将 FUNCTION 角色的结果转为 USER 消息
-    │
-    ▼
-发送给模型 API
-    │
-    ▼
-BaseFnCallModel._postprocess_messages()   ← function_calling.py:68
-    │
-    ├── 1. 从 LLM 输出文本中提取工具调用标记
-    │       ├── 解析 name / arguments
-    │       └── 重建 FunctionCall 对象
-    │
-    ├── 2. self.fncall_prompt.postprocess_fncall_messages()
-    │
-    ▼
-结构化 Message 列表 (含 function_call 字段)
-```
-
-### 2.3 降级策略：_remove_fncall_messages
-
-当 `functions` 为空或 `function_choice == 'none'` 时，`_remove_fncall_messages()`（function_calling.py:84）将历史中的 function_call 和 FUNCTION 消息转为 USER 消息的可读描述，避免模型尝试工具调用。
+**`BaseFnCallPrompt.preprocess_fncall_messages` 行 34-35 直接 `raise NotImplementedError`**——接口式抽象，自定义模板必须从头写 pre、post，无 skeleton 可继承。
 
 ---
 
-## 3. 两种模板对比与选择指南
+## 2. Nous 模板：纯文本 `[TOOL_CALL]...[/TOOL_END]`
 
-| 维度 | Nous 格式 | Qwen 格式 |
-|------|-----------|-----------|
-| **默认** | ✅ 是 | 否 |
-| **标记风格** | 文本标记 `[TOOL_CALL]`/`[TOOL_END]` | 花形特殊标记 `✿FUNCTION✿` 等 |
-| **模型兼容性** | 任何 chat 模型 | 需要特殊 tokenizer 支持 |
-| **双语** | 仅英文 | 中文 + 英文 |
-| **并行调用** | ✅ | ✅ |
-| **function_choice** | ❌ 仅 auto | ✅ 支持指定函数 |
-| **Code Interpreter** | ✅ 专用模板 | 无特殊处理 |
-| **推荐场景** | 开源模型、vLLM 部署 | Qwen 系列原生模型 |
+System prompt 用 `<tools>...</tools>` XML 包裹 functions 列表（`FNCALL_TEMPLATE`，行 264-285）。assistant 调工具时输出 `[TOOL_CALL]\n{json}\n[/TOOL_END]` 纯文本。
 
-**选择建议**：
-- 使用 Qwen 系列模型 + DashScope → 两种都行，Qwen 格式在中文场景略优
-- 使用开源模型 + vLLM/Ollama → **Nous 格式**（更通用）
-- 需要 function_choice 约束 → **Qwen 格式**
+特点：
+- 任何 chat 模型都能跑（无 Unicode 特殊标记）
+- 与 OpenAI tool schema 兼容（每工具一行 JSON）
+- **不支持 `function_choice` 约束**：行 38-39 遇到非 auto 直接 raise `NotImplementedError`
+
+详细决策与坑见扁平版 §2~§6。这里强调两点：
+1. `<tools>` XML 只是文本提示，**无 XML parser**——tool description 含字面 `</tools>` 会提前闭合 prompt，是 prompt 安全隐患。
+2. Nous 的 postprocess 处理 `<tag>thought</tag>` 思维链包裹（行 136-147），是 Qwen-Agent 对 Qwen3/QwQ 推理模型的深度集成点（05 章不提，02 章独有）。
 
 ---
 
-## 4. 配置方式
+## 3. Qwen 模板：花形 Unicode 标记 + 4 变体
+
+**特殊标记**（`qwen_fncall_prompt.py:233-237`）：
+```
+FN_NAME = '✿FUNCTION✿'
+FN_ARGS = '✿ARGS✿'
+FN_RESULT = '✿RESULT✿'
+FN_EXIT = '✿RETURN✿'
+FN_STOP_WORDS = [FN_RESULT, FN_EXIT]
+```
+
+4 变体 (`qwen_fncall_prompt.py:327-331`)：`zh` / `en` / `zh_parallel` / `en_parallel`。
+
+**双语 + 并行调用支持**，是 Qwen 原生 prompt 设计的最大差异点。Unicode 标记要求 tokenizer 支持；Qwen 系列 tokenizer 对此原生兼容。
+
+**`function_choice` 实现**（行 95-107）：preprocess 时在 last user message 末尾追加 `✿FUNCTION✿: <指定函数名>`——这是**软引导**——贴着 query 走最小污染，但模型仍可能反悔不调；强约束靠 stop word `✿RESULT✿` 触发暂停等结果。
+
+---
+
+## 4. 两种模板对比（速查）
+
+| 维度              | Nous                                    | Qwen                                          |
+|-------------------|-----------------------------------------|-----------------------------------------------|
+| 默认               | ✅ 是                                   | 否                                            |
+| 标记风格          | 文本 `[TOOL_CALL]` / `[/TOOL_END]`     | Unicode 花形 `✿FUNCTION✿` 等                   |
+| 模型兼容          | 任何 chat 模型                          | 需 tokenizer 支持 `✿` 标记                     |
+| 双语              | 仅英文                                  | 中文 + 英文                                    |
+| 并行调用          | ✅                                       | ✅（额外模板 _parallel 变体）                  |
+| `function_choice` | ❌ 仅 auto，传其他 raise                | ✅ 支持任意字符串                              |
+| Code Interpreter  | ✅ `SPECIAL_CODE_MODE` 专 path          | 无 special 处理                                |
+| 推理模型 thought  | ✅ `<tag>thought</tag>` 包裹识别         | 无（Qwen 模板内 thought 直接在 `✿RESULT✿` 前文）|
+| 推荐场景          | 开源模型 + vLLM/Ollama 部署              | Qwen 系列原生模型 + DashScope                 |
+
+选择建议：用 Qwen 系列模型 + DashScope → 二者均可（Qwen 模板在中文略优）；用开源模型 + vLLM/Ollama → **Nous**；需要 function_choice 约束 → **Qwen**。
+
+---
+
+## 5. FnCall 预处理 / 后处理流程
+
+```
+原始 messages
+  ▼
+BaseChatModel._preprocess_messages   (multimodal 格式归一)
+  ▼
+BaseFnCallModel._preprocess_messages (function_calling.py:41)
+  ├─ super()._preprocess_messages(...)
+  └─ self.fncall_prompt.preprocess_fncall_messages(
+        把 functions 列表注入 system prompt
+        把 assistant.function_call 字段 → 文本标记
+        把 FUNCTION role tool result → USER role 包 tag
+        function_choice 强引导（仅 Qwen 模板）
+     )
+
+[发送到 LLM API]
+
+  ▼
+BaseFnCallModel._postprocess_messages (function_calling.py:68)
+  └─ self.fncall_prompt.postprocess_fncall_messages(
+        处理 thought 包裹（Qwen3 推理路径，Nous 独有此处理器）
+        从文本标记提取 name/args → 重建 FunctionCall 对象
+     )
+  ▼
+结构化 Message 列表返给 FnCallAgent
+```
+
+**降级路径 `_remove_fncall_messages`**（`function_calling.py:84`）：`functions=[]` 或 `function_choice='none'` 时，把历史里 function_call 字段转为"调用过 X，返回 Y"的可读 USER 描述。常被忽略但是 _preprocess 的另一分支。
+
+详细见扁平版 §6。
+
+---
+
+## 6. 改这块代码前的检查清单
+
+- [ ] 自定义模板必须实现 pre + post，**无 skeleton 可继承**
+- [ ] `fncall_prompt_type` 只能 `__init__` 时定，不能跨调用切换
+- [ ] tool description 字符串**不能含 `<tools>` 或 `</tools>`**——会被 prompt 误闭合
+- [ ] 启用 `SPECIAL_CODE_MODE` 必须 pre + post 同步，环境变量全程稳定
+- [ ] 用 Qwen `function_choice` 只强引导 name 不强引导 arguments，参数错仍失败
+- [ ] 用 Nous 时传 `function_choice != 'auto'` → 直接 raise NotImplementedError
+- [ ] 多 Agent 编排：上游 Agent 的 function_call 输出会被下游当**普通文本**接收，是幻觉源
+- [ ] History 里多模态 tool result：postprocess 只还原文本占位，图像 ContentItem 保留但缺"来自哪个 tool"的标注
+- [ ] Qwen3 推理模型在 Nous 路径下，模型不闭合 `[/TOOL_END]` → 整段输出被当 thought，**没 tool_call 被 parse**
+
+---
+
+## 7. 配置方式
 
 ```python
-# 在 generate_cfg 中指定 FnCall 模板类型
 llm_cfg = {
     'model': 'qwen-max',
     'model_type': 'qwen_dashscope',
     'generate_cfg': {
-        'fncall_prompt_type': 'nous',  # 'nous' (默认) 或 'qwen'
+        'fncall_prompt_type': 'nous',  # 'nous'（默认）或 'qwen'
     }
 }
 
-# 环境变量方式
+# 环境变量
 import os
-os.environ['SPECIAL_CODE_MODE'] = 'true'  # 启用 Code Interpreter 特殊模板
+os.environ['SPECIAL_CODE_MODE'] = 'true'  # 启用 Code Interpreter 专门模板（仅 Nous）
 ```
 
 ---
 
-## 5. 核心源码索引
+## 8. 下一步深入学习
 
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `llm/function_calling.py` | 23 | `BaseFnCallModel` 类定义 |
-| `llm/function_calling.py` | 41 | `_preprocess_messages` |
-| `llm/function_calling.py` | 68 | `_postprocess_messages` |
-| `llm/function_calling.py` | 84 | `_remove_fncall_messages` (降级) |
-| `llm/function_calling.py` | 120 | `_chat_with_functions` |
-| `llm/function_calling.py` | 148 | `simulate_response_completion_with_chat` |
-| `llm/fncall_prompts/base_fncall_prompt.py` | 21 | `BaseFnCallPrompt` 接口 |
+- Nous 详细 prompt 模板与 pre/post 处理：[02-fncall-nous.md](./02-fncall-nous.md)
+- Qwen 花形标记模板与 function_choice 详解：[02-fncall-qwen.md](./02-fncall-qwen.md)
+- 完整"决策点+为什么不那样+踩坑清单"深度版：仓库 `docs/02_Function_Call.md`
+- FnCallAgent 的循环骨架与终止条件：[01 Overview](./01-overview.md) §8
+
+完。
