@@ -1,306 +1,109 @@
-# 09 Memory 机制深度剖析：从分块到 BM25 的原码级拆解
+# 09 Memory 机制深度剖析：导览
 
-> 本文是 [05 Memory 与 RAG](./05-memory.md) 的姊妹篇。05 讲架构与流程，本文下钻到原码级细节：切块 overlap、缓存键设计、知识注入，以及工程上的坑。所有行号基于仓库 `main` 分支。
+> 本文是 [05 Memory 与 RAG](./05-memory.md) 的姊妹篇。05 讲架构与流程，本系列下钻到原码级——**只回答一件事：为什么这样做、不那样做会怎样、改了会踩什么坑**。所有行号基于仓库 `main` 分支。
 
-深入专题（因篇幅拆为子页）：
+## 这套 Memory 子系统由三个问题贯穿
 
-- [关键词生成策略详解](./09-memory-keygen.md)：5 种 keygen 策略的 prompt 原文、stop 词技巧、mem_llm 选择
-- [分词与检索排序](./09-memory-retrieval.md)：QWenTokenizer、中英文分流分词、BM25、RRF 融合、装入与兜底
+读这一系列前先确立心智模型：当你传一个文件给 Qwen-Agent 问问题时，背后发生了什么——
 
----
+- **抽 query**：取**最后一条 user 消息**当 query，多轮历史完全丢弃（这是设计选择，不是 bug）。
+- **重写 query**：用 LLM 把自然语言改写成结构化 JSON（含中英文关键词 + 改写后的 query），这一步叫 keygen。无 LLM 配置时**整条链路跳过**。
+- **检索 + 排序**：BM25 打分 + front_page 强置顶 + RRF 融合，按 token 预算装回 prompt。
 
-## 1. 全景调用链
+每个环节都有“如果不这样做会怎样”的具体答案。后面两个子页就分别拆 keygen 环节和检索环节，每个子页以原码级证据 + 设计权衡表 + 踩坑清单方式展开。
 
-一次带文件的问答，完整链路如下：
+## 阅读地图
 
-```
-用户 messages (含 item.file)
-    │
-    ▼
-Assistant._run (assistant.py:113)
-    │
-    ├── _prepend_knowledge_prompt (assistant.py:116)
-    │       │
-    │       ▼
-    │   Memory.run → Memory._run (memory.py:81)
-    │       │
-    │       ├── 1. get_rag_files (memory.py:146)
-    │       │      extract_files_from_messages + system_files
-    │       │      过滤为 9 种受支持格式
-    │       │      （无文件 → yield 空消息，提前结束）
-    │       │
-    │       ├── 2. 取最后一条 user 消息文本作为 query (memory.py:103)
-    │       │
-    │       ├── 3. keygen 关键词生成 (memory.py:107-132)
-    │       │      动态 import 策略类（默认 GenKeyword）
-    │       │      产出 {"keywords_zh": [...], "keywords_en": [...], "text": ...}
-    │       │
-    │       └── 4. retrieval 工具调用 (memory.py:134)
-    │              │
-    │              ▼
-    │          Retrieval.call (retrieval.py:79)
-    │              │
-    │              ├── 逐文件 DocParser.call (doc_parser.py:80)
-    │              │      ├── 查缓存（sha256(url)_page_size）
-    │              │      ├── SimpleDocParser 解析 → 结构化分页文档
-    │              │      ├── 全文 ≤ max_ref_token → 整篇单 chunk
-    │              │      └── 否则 split_doc_to_chunk 切块（带 overlap）
-    │              │      → Record(url, raw=[Chunk...], title)，写缓存
-    │              │
-    │              └── search.call (base_search.py:56)
-    │                     ├── 总 token ≤ max_ref_token → 全量返回
-    │                     ├── sort_by_scores（BM25 / front_page / RRF 融合）
-    │                     └── get_topk 按预算装入、截断
-    │
-    │       yield Message(name='memory', content=检索结果 JSON)
-    │
-    ├── format_knowledge_to_source_and_content (assistant.py:52)
-    │       → [{'source': '[文件](xx.pdf)', 'content': '...'}]
-    │
-    ├── KNOWLEDGE_SNIPPET / KNOWLEDGE_TEMPLATE 拼装
-    │       追加到 system 消息末尾
-    │
-    ▼
-FnCallAgent._run  ← 进入 LLM + Tool 循环
-```
+| 看这一篇时关心的问题                                       | 跳转到 |
+|-----------------------------------------------------------|--------|
+| Memory 和 retrieval 怎么挂上、文件流转管线是什么          | 本篇 §1 |
+| keygen 的 4 个策略有什么差异、默认是哪个、缓存机制        | [09-memory-keygen.md](./09-memory-keygen.md) |
+| BM25 怎么打分、RRF 公式形状、front_page 强置顶什么时候失效 | [09-memory-retrieval.md](./09-memory-retrieval.md) |
+| 切块大小是 token 还是 char、overlap 怎么定义、跨页怎么处理 | 本篇 §2 |
+| 缓存键怎么设计、为什么会污染、怎么清                       | [09-memory-retrieval.md](./09-memory-retrieval.md) §4 |
+| 全部 8 个设计决策 + 4 个开放 TODO 一张速查表              | 本文末 §3 |
 
-两个关键认知：
-
-- **Memory 不走 LLM 对话**。它的产出是 `name='memory'` 的 assistant 消息，LLM 仅在 keygen 环节被调用。
-- **注入方式是"写死"在 system prompt 里**，不是 function call 结果，用户无感、每轮必发生（有文件时）。
-
----
-
-## 2. 检索触发与文件收集
-
-`get_rag_files`（memory.py:146-154）合并两个来源后去重：
-
-- `extract_files_from_messages(messages, include_images=False)`（utils/utils.py:465）——从消息 content 中取 `item.file`；
-- `self.system_files`——构造 Memory 时传入的常驻文件（memory.py:79）。
-
-随后用 `get_file_type`（utils.py:242）过滤，只保留 `PARSER_SUPPORTED_FILE_TYPES`（simple_doc_parser.py:368）：
-
-```python
-PARSER_SUPPORTED_FILE_TYPES = ['pdf', 'docx', 'pptx', 'txt', 'html', 'csv', 'tsv', 'xlsx', 'xls']
-```
-
-query 取自最后一条 user 消息（memory.py:103-104，`extract_text_from_message(..., add_upload_info=False)`）。
-
-**无文件兜底**：`if not rag_files: yield [Message(ASSISTANT, content='', name='memory')]`（memory.py:98-99）。上游 `if knowledge:`（assistant.py:128）为假 → 不注入知识库段落，system 里**完全不会出现**"知识库"字样。兜底策略是"不写"，而非写"未找到"。
-
----
-
-## 3. 文档解析与切块原码拆解
-
-### 3.1 统一产出结构
-
-`SimpleDocParser`（simple_doc_parser.py）把 9 种格式统一解析为按页列表，每个段落带 token 计数（:475-478）：
-
-```python
-[{'page_num': 1, 'content': [{'text': ...} 或 {'table': ...}], 'title'?}, ...]
-```
-
-各格式要点：
-
-| 格式 | 解析方式 | 页的概念 |
-|------|----------|----------|
-| pdf | pdfminer 提取版面 + pdfplumber 抽表格，按字号/行高合并误拆行（:240-327） | PDF 真实页 |
-| docx | python-docx 逐段 + 表格转 markdown（:59-77） | 整篇 1 页 |
-| pptx | 文本框段落 + 表格转 markdown（:80-113） | 每页幻灯片 1 页 |
-| txt | 按 `\n` 分段（:116-124） | 整篇 1 页 |
-| html | BeautifulSoup 取纯文本 + `<title>`（:202-237） | 整篇 1 页 |
-| csv/tsv/xlsx/xls | pandas → markdown 管道表（:127-199） | Excel 每个 sheet 1 页 |
-
-表格统一转 markdown 管道格式参与切块；**图片完全不支持**，`extract_image=True` 一律报错。
-
-### 3.2 split_doc_to_chunk 的三段逻辑
-
-切块按 **token**（不按页/段落硬切），预算 = `parser_page_size`（默认 500）。`chunk` 内部混合两种元素：页标记字符串 `[page: n]` 和内容项 `[txt, page_num]`。
-
-1. **段落放得下**（doc_parser.py:173-177）：扣 token、追加，标记 `has_para=True`。
-2. **段落放不下且 chunk 已有内容**（:179-202）：封 chunk（`token = parser_page_size - available_token`），取 overlap 开新 chunk（见 3.3）。
-3. **段落放不下且 chunk 为空（超长段落）**（:203-260）：先按 `re.split(r'\. |。', txt)` 拆句；单句仍超预算则 **token 级定长滑窗硬切**（:216-220）：
-
-```python
-token_list = tokenizer.tokenize(s)
-for si in range(0, len(token_list), available_token):
-    ss = tokenizer.convert_tokens_to_string(
-        token_list[si:min(len(token_list), si + available_token)])
-    sentences.append([ss, min(available_token, len(token_list) - si)])
-```
-
-装句时 `if token <= available_token or (not has_para)` 保证至少塞进一句，防止死循环。
-
-### 3.3 _get_last_part：150 字符 overlap 的取法
-
-doc_parser.py:275-309，从 chunk 末尾**倒序**收集与最后一页同页的内容，预算 150 **字符**（不是 token）：
-
-- 整段能装 → 整段前插（段落间 `\n` 连接）；
-- 装不下的段落 → 拆句（`. ` 或 `。`），按句前插，遇到装不下的句子即停；
-- 跨页即停。
-
-overlap 以纯字符串形式进新 chunk 头部且 `has_para=False`——它不计入正式段落，只是上下文粘合剂。
-
-### 3.4 数据结构
-
-Chunk / Record 直接定义在 doc_parser.py:32-53（`tool_defs.py` 不存在）：
-
-```python
-class Chunk(BaseModel):
-    content: str
-    metadata: dict   # {'source': path, 'title': title, 'chunk_id': n}
-    token: int
-
-class Record(BaseModel):
-    url: str
-    raw: List[Chunk]
-    title: str
-```
-
----
-
-## 4. extract_doc_vocabulary：文档词表工具
-
-`qwen_agent/tools/extract_doc_vocabulary.py`（82 行），仅供 WithKnowledge 系 keygen 策略调用：
-
-1. SimpleDocParser 把每个文件解析为纯文本；
-2. 以 `str(files)` 为缓存 key 查 Storage，命中直接返回；
-3. 未命中：`TfidfVectorizer(tokenizer=string_tokenizer, stop_words=WORDS_TO_IGNORE)`（复用检索分词器和停用词表，sklearn 延迟导入）fit_transform，按 TF-IDF 值降序拼接全部词项，写缓存。
-
-缓存目录 `workspace/tools/extract_doc_vocabulary`。
-
----
-
-## 5. 两级缓存与 Storage
-
-### 5.1 缓存键设计
-
-| 层级 | 键 | 内容 | 目录 |
-|------|-----|------|------|
-| SimpleDocParser | `sha256(path)_ori` | 解析后的结构化分页文档 | `workspace/tools/simple_doc_parser/` |
-| DocParser（切块） | `sha256(url)_<page_size>` | 切好的 Record JSON | `workspace/tools/doc_parser/` |
-| DocParser（整篇） | `sha256(url)_without_chunking` | 单 chunk Record | 同上 |
-| ExtractDocVocabulary | `str(files)` | TF-IDF 词表 | `workspace/tools/extract_doc_vocabulary/` |
-
-page_size 进缓存键，改配置不会读到旧切块。HTTP URL 会先下载到 `workspace/tools/simple_doc_parser/<hash>/`。
-
-**已知缺陷**：键基于**路径字符串**的 sha256，本地文件内容变更但路径不变时会命中旧缓存。
-
-### 5.2 Storage 实现
-
-`tools/storage.py`（120 行）：文件系统 KV，"一个 key 一个文件"，key 中的 `/` 映射为子目录。API：`put` / `get`（不存在抛 `KeyNotExistsError`）/ `delete` / `scan`（遍历目录拼 `key: value`）。
-
-工程注意：
-
-- **无任何锁/原子写**，并发 put 同 key 会撕裂写；
-- key 未过滤 `..`，理论上可路径逃逸出 root；
-- 定位是 demo 级实现，非生产 KV。
-
----
-
-## 6. 知识注入与预算控制
-
-### 6.1 模板原文
-
-assistant.py:27-49：
-
-```python
-KNOWLEDGE_TEMPLATE_ZH = """# 知识库
-
-{knowledge}"""
-
-KNOWLEDGE_SNIPPET_ZH = """## 来自 {source} 的内容：
+## §1. 完整管线一图
 
 ```
-{content}
-```"""
+用户输入 messages + 挂载文件 (item.file)
+         │
+         ▼
+Memory._run (memory.py:81)
+         │
+         ├── get_rag_files        → PARSER_SUPPORTED_FILE_TYPES 静默过滤
+         ├── 取 messages[-1]      → 仅最后一条 USER 当 query
+         ├── keygen 选 strategy   → 4 个策略反射路由
+         │   └── 输出 JSON 串  {"keywords_zh": [...], "keywords_en": [...], "text": <rewrite>}
+         │
+         └── retrieval.call       → 内部对每个 file 调 DocParser 得 Record
+                                  → HybridSearch  融合 KeywordSearch + FrontPageSearch
+                                      ├─ BM25Okapi(k1=1.5,b=0.75)
+                                      ├─ FrontPageSearch（单 doc，前 2 chunk 给 inf）
+                                      └─ RRF: 1/(rank+1+60) 累加
+                                  → get_topk：按 token 预算装 chunk 到 max_ref_token
+                                  → 返回 RefMaterialOutput[url, text=[snippet list]]
 ```
 
-`format_knowledge_to_source_and_content`（assistant.py:52-78）把 retrieval 输出转为 `{source: '[文件](xx.pdf)', content: '...'}`，多 chunk 用 `\n\n...\n\n` 连接表示省略；非 JSON 输入整体作为 `{'source': '上传的文档', ...}` 一条。最终**追加到 system 消息末尾**（无 system 则新建一条插最前，assistant.py:140-148）。
+## §2. 切块和缓存的简单结论
 
-### 6.2 max_ref_token 的三处生效点
+详细推理见子页和扁平版；本节给可以直接拿走的两条结论：
 
-全链路唯一的内容上限是 `max_ref_token`（默认 20000）：
+- **切块按 token，默认 500**：来自 `settings.py` 的 `DEFAULT_PARSER_PAGE_SIZE`。当整文档总 token ≤ `max_ref_token`（默认 20000）时根本不切，做成单大 chunk。
+- **overlap 在跨 chunk 时按字符 150**：`_get_last_part` 的 `available_len=150` 是 hard-coded，与 token 预算不共用度量；跨页处不 overlap，零冗余。代价是中英混排文档时 overlap 占 chunk 大小波动在 10%~40%。
 
-1. `BaseSearch.call` 全文短路（base_search.py:80）；
-2. `get_topk` 装入预算（base_search.py:111）；
-3. `_get_the_front_part` 均分预算（base_search.py:167）。
+## §3. 全设计决策速查表（8 项）
 
-注入 system 后**没有再做 token 校验**，超出 LLM 上下文由 LLM 层的 `DEFAULT_MAX_INPUT_TOKENS`（58000）截断机制兜底。
+| 决策 # | 决策点                                                | 替代方案不选的理由             |
+|--------|------------------------------------------------------|--------------------------------|
+| 1      | 无 LLM → 直接跳过 keygen                              | 本地分词已能覆盖，避免双轨     |
+| 2      | query 只取最末 user 消息                               | 多轮 rewrite 会破坏 keygen prompt 纯净 |
+| 3      | 中文关键词不再二次分词                                 | 防短词打散，代价是长短语失命中 |
+| 4      | front_page 仅单文档生效                                | 多文档无法公平比较前 2 页       |
+| 5      | 缓存键不含 max_ref_token                              | 实际两套独立 string key 不串读写 |
+| 6      | overlap 用 char=150 而非 token                         | 不依赖 tokenizer 加载，代价是中英比例波动 |
+| 7      | BM25 用外库默认 + RRF 常数 60                          | 调参收益小，未实证             |
+| 8      | 不支持的文件类型静默丢弃                                | 避免破坏多模态路径             |
 
----
+## §4. 4 个开放 TODO（源码里写着但未解决）
 
-## 7. MemoAssistant：另一种"记忆"
+| #  | TODO                                        | 位置                         |
+|----|---------------------------------------------|------------------------------|
+| 1  | RRF 常数是否需要调优                        | hybrid_search.py:52          |
+| 2  | vector_search 性能优化                      | vector_search.py:24          |
+| 3  | parse_keyword 的 broad except 太宽          | keyword_search.py:195        |
+| 4  | multi-turn query rewrite 未做                | 设计空白，无 TODO 标注        |
 
-`MemoAssistant`（agents/memo_assistant.py）是对话级长期记忆，与文档 RAG 是两个维度：
+## §5. 真实源码路径修正
 
-- 强制注册 `storage` 工具，MEMORY_PROMPT（memo_assistant.py:25-38）引导模型**自主决定**存什么（"你的记忆很短暂，请频繁的调用工具存储或读取重要对话内容"）；
-- `_prepend_storage_info_to_sys`（:65-91）**回放历史消息里的 storage 调用记录**重建 KV 状态（不读数据库，从对话历史推导"当前记忆"），全量嵌入 system；
-- 注释声称"仅保留最近三轮对话"，实际代码 `available_turn = 400`（:93-110）——**注释已过时**。
+下表为生产真实位置，与 05 章 / 官方早期 doc 不一致：
 
-两者可叠加：MemoAssistant 本身是 Assistant 子类，`files` 参数仍走文档 RAG 链路。
+| 真实路径                                              | 作用                          |
+|-------------------------------------------------------|-------------------------------|
+| `qwen_agent/memory/memory.py`                         | Memory._run 主入口            |
+| `qwen_agent/agents/keygen_strategies/__init__.py`      | 4 个 keygen 策略类的 re-export |
+| `qwen_agent/tools/search_tools/keyword_search.py`      | BM25 + 分词 + parse_keyword   |
+| `qwen_agent/tools/search_tools/hybrid_search.py`      | RRF 融合                      |
+| `qwen_agent/tools/search_tools/front_page_search.py`  | 前 2 页 inf 置顶              |
+| `qwen_agent/tools/search_tools/base_search.py`        | BaseSearch.call + 三级兜底    |
+| `qwen_agent/tools/doc_parser.py`                      | 切块 + 缓存                   |
+| `qwen_agent/tools/simple_doc_parser.py`               | OCR + 单 doc 结构提取         |
+| `qwen_agent/tools/retrieval.py`                       | 入口工具封装                  |
+| `qwen_agent/storages/storage.py`                      | file-based kv，无内存层、无 flush |
 
----
+## §6. 接下来怎么读
 
-## 8. 配置全表
+- 对 keygen 这一环的 prompt 模板、split 失败回退、with_knowledge 词表注入感兴趣：[09-memory-keygen.md](./09-memory-keygen.md)
+- 对检索排序的 BM25 参数选择、RRF 公式的"rank 复用"隐式契约、front_page 的"4 倍 token 裕度"判定条件感兴趣：[09-memory-retrieval.md](./09-memory-retrieval.md)
+- 想要 13 节完整深度版（含每节“为什么不那样” + 逐项踩坑清单）：仓库 `docs/09_Memory机制深度剖析.md`
 
-`rag_cfg` dict 传入（`Memory(rag_cfg=...)` 或 `Assistant(rag_cfg=...)` 透传），默认值在 `qwen_agent/settings.py`（全文仅 39 行）：
+读完应能回答的 8 个判断题（答案都在扁平版对应小节）：
 
-| 参数 | 默认值 | 环境变量 | 作用 |
-|------|--------|----------|------|
-| `max_ref_token` | 20000 | `QWEN_AGENT_DEFAULT_MAX_REF_TOKEN` | 检索材料总 token 窗口 |
-| `parser_page_size` | 500 | `QWEN_AGENT_DEFAULT_PARSER_PAGE_SIZE` | 单 chunk token 上限（也是缓存键一部分） |
-| `rag_keygen_strategy` | `GenKeyword` | `QWEN_AGENT_DEFAULT_RAG_KEYGEN_STRATEGY` | 关键词生成策略，可选 `None` / `SplitQueryThenGenKeyword` / 两个 `WithKnowledge` 变体 |
-| `rag_searchers` | `['keyword_search', 'front_page_search']` | `QWEN_AGENT_DEFAULT_RAG_SEARCHERS`（ast.literal_eval 解析） | 子检索器列表，>1 自动 RRF 融合 |
-| —（LLM 层） | 58000 | `QWEN_AGENT_DEFAULT_MAX_INPUT_TOKENS` | 输入消息截断上限 |
-| —（Agent 层） | 20 | `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` | 单轮最多 LLM 调用次数 |
-| —（工作区） | `workspace` | `QWEN_AGENT_DEFAULT_WORKSPACE` | 缓存/下载根目录 |
-
-硬编码常量：`DEFAULT_FRONT_PAGE_NUM = 2`（front_page_search.py:24）、overlap 上限 150 字符（doc_parser.py:278）、RRF k=60（hybrid_search.py:53）。
-
----
-
-## 9. 工程注意事项汇总
-
-1. **docstring 与 settings 不一致**：memory.py:51 示例写 `max_ref_token=4000`、keygen 用 `SplitQueryThenGenKeyword`，实际默认 20000 / `GenKeyword`，以 settings 为准。
-2. **缓存按路径 hash**：本地文件改了内容但路径不变，命中旧缓存。排查解析问题时先清 `workspace/tools/`。
-3. **BM25 每次重建**：无持久化索引，大文档多轮问答的分词开销线性累积。
-4. **中英混排走 jieba**：任一 CJK 字符触发中文路径，英文正则过滤被跳过。
-5. **storage 非生产级**：无锁、可路径逃逸。
-6. **MemoAssistant 注释过时**：声称保留 3 轮，实际 400 轮。
-7. **get_topk 截断即 break**：预算不足时后面的小 chunk 没有机会递补。
-8. **keygen 失败静默降级**：JSON 解析失败退回原始 query，不报错。
-
----
-
-## 10. 核心源码索引
-
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `memory/memory.py` | 32 | `Memory(Agent)` 类 |
-| `memory/memory.py` | 81 | `_run` 检索主流程 |
-| `memory/memory.py` | 107-132 | keygen 动态加载与 text 补齐 |
-| `agents/keygen_strategies/gen_keyword.py` | 26-42 | GenKeyword prompt 原文 |
-| `agents/keygen_strategies/split_query.py` | 85-90 | stop 词省 token 技巧 |
-| `agents/keygen_strategies/gen_keyword_with_knowledge.py` | 72-79 | 文档词表注入 |
-| `tools/retrieval.py` | 72-77 | searcher 选择 / HybridSearch 包装 |
-| `tools/doc_parser.py` | 32-53 | Chunk / Record 数据结构 |
-| `tools/doc_parser.py` | 152-273 | `split_doc_to_chunk` 三段逻辑 |
-| `tools/doc_parser.py` | 275-309 | `_get_last_part` 150 字符 overlap |
-| `tools/search_tools/keyword_search.py` | 44-66 | BM25 打分 |
-| `tools/search_tools/keyword_search.py` | 69-87 | WORDS_TO_IGNORE 停用词表 |
-| `tools/search_tools/keyword_search.py` | 132-156 | string_tokenizer 中英文分流 |
-| `tools/search_tools/keyword_search.py` | 169-196 | parse_keyword 三字段处理 |
-| `tools/search_tools/hybrid_search.py` | 35-60 | RRF 融合（k=60） |
-| `tools/search_tools/front_page_search.py` | 27-49 | 前 2 chunk +inf 保底 |
-| `tools/search_tools/base_search.py` | 56-87 | call 分支与全文短路 |
-| `tools/search_tools/base_search.py` | 107-137 | get_topk 装入 |
-| `tools/search_tools/base_search.py` | 165-184 | _get_the_front_part 兜底 |
-| `tools/extract_doc_vocabulary.py` | 52-82 | TF-IDF 词表提取 |
-| `tools/storage.py` | 75-120 | KV 存储 API |
-| `utils/tokenization_qwen.py` | 218-239 | count_tokens / truncate |
-| `agents/assistant.py` | 27-49 | KNOWLEDGE 模板原文 |
-| `agents/assistant.py` | 52-78 | 检索结果格式化 |
-| `agents/fncall_agent.py` | 56-71 | mem_llm 推理模型特判 |
-| `agents/memo_assistant.py` | 25-110 | 对话级长期记忆 |
-| `settings.py` | 1-39 | 全部默认值与环境变量 |
+1. 用户没传 llm 时，keygen 是被跳过还是降级？
+2. 多轮里 “它 / 上一篇” 这种指代，检索能被还原吗？
+3. `keywords_zh: ["论文摘要"]` 这种长短语在 BM25 上能命中吗？
+4. 多文档场景下“前 2 个 chunk 强置顶”还生效吗？
+5. 第一次取整块、第二次调小 max_ref_token 会不会复用旧缓存错分？
+6. `parser_page_size` 与 overlap 的 150 是同一个度量吗？
+7. BM25 的 k1 / b 是不是自实现的、有没有非标准改造？
+8. 同一文件两个_URL 表达形式会让 DocParser 重复解析吗？
