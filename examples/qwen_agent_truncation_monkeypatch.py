@@ -8,7 +8,7 @@
 
 本补丁解决四个问题（详见同目录 llm_truncation_monkeypatch.md）：
 
-1. assistant 消息同时带 content 和 function_call 时，content 不计入 token；
+1. assistant 消息的 content/reasoning_content/function_call 没有全部计入 token；
 2. functions/tool schema 每次请求都会带上，但从未计入预算；
 3. 截断时从最老的 user turn 开始删，最初的审计任务描述最先被丢弃；
 4. MCP/工具结果无上限地进入 FUNCTION 消息，导致历史快速膨胀。
@@ -53,21 +53,53 @@ def _count_functions(functions: Optional[List[Dict]]) -> int:
         return 0
 
 
+def _content_tokens(msg: Any) -> int:
+    """消息正文的 token 数（与上游口径一致）。"""
+    return tokenizer.count_tokens(extract_text_from_message(msg, add_upload_info=True))
+
+
+def _reasoning_tokens(msg: Any) -> int:
+    """reasoning_content 的 token 数（str 或 List[ContentItem]，推理模型历史会随请求重发）。"""
+    rc = msg.reasoning_content
+    if not rc:
+        return 0
+    if isinstance(rc, str):
+        return tokenizer.count_tokens(rc)
+    n = 0
+    for item in rc:
+        if item.text:
+            n += tokenizer.count_tokens(item.text)
+    return n
+
+
+def _fc_tokens(msg: Any) -> int:
+    """assistant function_call 的 token 数。"""
+    if msg.role == ASSISTANT and msg.function_call:
+        return tokenizer.count_tokens(f'{msg.function_call}')
+    return 0
+
+
 def _count_tokens(msg: Any) -> int:
-    """修正后的 token 计数：assistant 消息同时数 content 和 function_call。"""
-    if msg.role == ASSISTANT:
-        n = 0
-        text = extract_text_from_message(msg, add_upload_info=True)
-        if text:
-            n += tokenizer.count_tokens(text)
-        if msg.function_call:
-            n += tokenizer.count_tokens(f'{msg.function_call}')
-        return n
-    n = tokenizer.count_tokens(extract_text_from_message(msg, add_upload_info=True))
+    """修正后的 token 计数：content + reasoning_content + function_call 都算。"""
+    n = _content_tokens(msg) + _reasoning_tokens(msg) + _fc_tokens(msg)
     if msg.role == FUNCTION and msg.name:
         # FUNCTION 消息的 name 字段也会进入请求
         n += tokenizer.count_tokens(msg.name)
     return n
+
+
+def _copy_with(msg: Any, update: Dict[str, Any]) -> Any:
+    """复制消息并替换指定字段，保留 role/name/function_call/extra/reasoning_content。
+
+    优先走 pydantic v2 的 model_copy（qwen_agent 依赖 pydantic>=2.3），
+    其他对象回退到 copy.copy + 属性赋值。
+    """
+    if hasattr(msg, 'model_copy'):
+        return msg.model_copy(update=update)
+    new_msg = copy.copy(msg)
+    for key, value in update.items():
+        setattr(new_msg, key, value)
+    return new_msg
 
 
 def _truncate_message(msg: Any, max_tokens: int, keep_both_sides: bool = False) -> Optional[Any]:
@@ -82,18 +114,21 @@ def _truncate_message(msg: Any, max_tokens: int, keep_both_sides: bool = False) 
             text.append(item.text)
         text = '\n'.join(text)
         content = tokenizer.truncate(text, max_token=max_tokens, keep_both_sides=keep_both_sides)
-    new_msg = copy.copy(msg)
-    new_msg.content = content
-    return new_msg
+    return _copy_with(msg, {'content': content})
+
+
+def _truncate_reasoning(msg: Any, max_tokens: int) -> Any:
+    """截断 reasoning_content（仅 str 类型；list 类型保持原样）。"""
+    if not isinstance(msg.reasoning_content, str):
+        return msg
+    rc = tokenizer.truncate(msg.reasoning_content, max_token=max_tokens, keep_both_sides=True)
+    return _copy_with(msg, {'reasoning_content': rc})
 
 
 def _truncate_to_total(msg: Any, total_target: int) -> Optional[Any]:
-    """把消息总 token（含 function_call）压到 total_target。"""
+    """把消息总 token（content + reasoning_content + function_call + name）压到 total_target。"""
     total_target = max(0, int(total_target))
-    content_target = total_target
-    if msg.role == ASSISTANT and msg.function_call:
-        fc_tokens = tokenizer.count_tokens(f'{msg.function_call}')
-        content_target = max(0, total_target - fc_tokens)
+    content_target = max(0, total_target - _fc_tokens(msg))
     cur = _truncate_message(msg, content_target, keep_both_sides=True)
     if cur is None:
         return None
@@ -102,8 +137,13 @@ def _truncate_to_total(msg: Any, total_target: int) -> Optional[Any]:
         t = _count_tokens(cur)
         if t <= total_target:
             return cur
-        content_target = max(0, content_target - (t - total_target))
-        cur = _truncate_message(cur, content_target, keep_both_sides=True)
+        overshoot = t - total_target
+        if isinstance(cur.reasoning_content, str) and _reasoning_tokens(cur) > 0:
+            # 正文已压到位，剩余超出量从 reasoning_content 里省
+            cur = _truncate_reasoning(cur, max(0, _reasoning_tokens(cur) - overshoot))
+        else:
+            content_target = max(0, content_target - overshoot)
+            cur = _truncate_message(cur, content_target, keep_both_sides=True)
     return cur
 
 
@@ -125,6 +165,17 @@ def _truncate_input_messages_roughly(messages: List[Any], max_tokens: int) -> Li
         )
     if not messages:
         return messages
+
+    # 与上游一致的入口校验：首条非 system 消息必须是 user
+    for m in messages:
+        if m.role == SYSTEM:
+            continue
+        if m.role != USER:
+            raise ModelServiceError(
+                code='400',
+                message='The input messages (excluding the system message) must start with a user message.',
+            )
+        break
 
     # ---- 计数并按 user turn 分组 ----
     message_tokens = defaultdict(int)
@@ -181,6 +232,7 @@ def _truncate_input_messages_roughly(messages: List[Any], max_tokens: int) -> Li
 
     def _iter_msg_positions(roles, last_turn_last=True):
         """按"旧轮在前、最后一轮最后"的顺序产出 (turn_i, msg_j, msg_idx, msg)。"""
+        roles = {roles} if isinstance(roles, str) else set(roles)
         order = list(range(len(turns) - 1))
         if last_turn_last:
             order.append(len(turns) - 1)
@@ -260,16 +312,19 @@ def _truncate_input_messages_roughly(messages: List[Any], max_tokens: int) -> Li
             if final_tokens <= available_token:
                 break
             deficit = final_tokens - available_token
-            candidates = [(i, m, _count_tokens(m))
-                          for i, m in enumerate(result)
-                          if m.role != SYSTEM and m is not task_msg and _count_tokens(m) > 0]
-            if not candidates:
-                candidates = [(i, m, _count_tokens(m))
-                              for i, m in enumerate(result)
-                              if m.role != SYSTEM and _count_tokens(m) > 0]
+            candidates = []
+            for i, m in enumerate(result):
+                if m.role == SYSTEM:
+                    continue
+                t = _count_tokens(m)
+                if t > 0:
+                    candidates.append((t, i, m))
             if not candidates:
                 break
-            i, m, t = max(candidates, key=lambda c: c[2])
+            # 优先压缩非任务消息，任务消息只作为最后手段
+            non_task = [c for c in candidates if c[2] is not task_msg]
+            pool = non_task or candidates
+            t, i, m = max(pool, key=lambda c: c[0])
             if t > deficit:
                 new_msg = _truncate_to_total(m, t - deficit)
                 if new_msg is not None:
@@ -351,8 +406,11 @@ def apply_patch(enable_tool_result_cap: bool = True) -> None:
 
     # 3) 工具结果源头限流（覆盖 FnCallAgent 经由 super()._call_tool 的路径）
     if enable_tool_result_cap:
-        from qwen_agent.agent import Agent as _Agent
-        _Agent._call_tool = _wrap_call_tool(_Agent._call_tool)
+        try:
+            from qwen_agent.agent import Agent as _Agent
+            _Agent._call_tool = _wrap_call_tool(_Agent._call_tool)
+        except Exception as e:  # 不影响核心截断补丁
+            logger.warning(f'qwen_agent_truncation_monkeypatch: failed to patch Agent._call_tool: {e}')
 
     _applied = True
     logger.info(

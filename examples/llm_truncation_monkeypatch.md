@@ -98,12 +98,16 @@ def _truncate_input_messages_roughly(messages, max_tokens):
 ---------------------------------  ----------------------------------------
 user/assistant/function 正文      正文 + <tool_call> 包裹 + <tool_response> 包裹
 assistant 的 function_call        正文（截断器常常漏数）
+reasoning_content（推理历史）      随请求重发（截断器漏数）
 FUNCTION 的 name                  工具结果里的名字
 system 消息                       系统提示 + # Tools + <tools>{全部工具schema}</tools>
                                   + 聊天模板/角色标记
 ```
 
 这就是 7.1 节"计数低估"的结构性原因：**截断器只数了结构化消息的一部分，而模型的输入里还有渲染开销和全部工具 schema**。
+
+另有两个入口校验（原版与补丁一致）：SYSTEM 消息超过 1 条抛 400；第一条非 SYSTEM
+消息必须是 USER，否则抛 400（"must start with a user message"）。
 
 ## 4. 裁剪算法（上游怎么裁剪的）
 
@@ -227,7 +231,8 @@ Phase D  最后手段：压缩任务描述本身
 | 丢弃顺序 | 从最老一轮开始 | 从中间轮开始，首尾轮保底 |
 | 任务描述 | 可能整轮被删（E4） | 最后才动，兜底循环也优先非任务消息 |
 | 工具结果 | 只截断进入上下文的旧结果 | 源头限流（`Agent._call_tool` 包装，默认 24k） |
-| 截断单条 | `Message(role, content)` 重建，丢字段 | `copy.copy(msg)` 只换 content，保留 function_call/name/extra |
+| 计数 | 漏正文/function_call 场景/name/reasoning | content + reasoning_content + function_call + name 全计 |
+| 截断单条 | `Message(role, content)` 重建，丢字段 | pydantic `model_copy(update=...)` 只换 content/reasoning，保留 function_call/name/extra |
 | 复检 | 无，末尾无条件返回 0 | 真实重计 + 兜底循环 + 超限抛 400 |
 | 截断误差 | `truncate` 后重计可能差 ±2 token | `_truncate_to_total` 迭代收敛（最多 3 次） |
 
@@ -241,7 +246,8 @@ Phase D  最后手段：压缩任务描述本身
 模块顶层
 ├─ 配置常量  TOOL_RESULT_MAX_TOKENS / SAFETY_MARGIN_TOKENS（支持环境变量覆盖）
 ├─ contextvar _cv_functions                     # 透传 functions 的通道
-├─ 工具函数   _count_functions / _count_tokens / _truncate_message / _truncate_to_total
+├─ 工具函数   _count_functions / _count_tokens / _content_tokens / _reasoning_tokens /
+│             _fc_tokens / _truncate_message / _truncate_reasoning / _truncate_to_total / _copy_with
 ├─ 主函数     _truncate_input_messages_roughly  # 四阶段 + 复检（见第 5 节）
 ├─ 工具结果限流 _cap_tool_result
 ├─ 包装器     _wrap_chat / _wrap_call_tool
@@ -290,8 +296,9 @@ def _truncate_input_messages_roughly(messages, max_tokens):
 ### 7.1 计数低估（all_tokens 小于真实请求）
 
 1. **assistant 带 function_call 时只数 function_call，不数正文**（base.py:627-630）。工具调用轮通常"正文 + function_call"都有。
-2. **functions/tool schema 从未计入**。raw_api 路径作为 `tools` 字段发送；nous 路径渲染进 system 消息——两条路径都发生在截断之后。
-3. **聊天模板/角色标记未计入**，`<tool_call>`/`<tool_response>` 包裹开销未计入。
+2. **`reasoning_content`（推理历史）未计入**。带思考的模型（QwQ/qwen3 等）的历史消息带 `reasoning_content`，请求里会重发，但计数完全忽略。
+3. **functions/tool schema 从未计入**。raw_api 路径作为 `tools` 字段发送；nous 路径渲染进 system 消息——两条路径都发生在截断之后。
+4. **聊天模板/角色标记未计入**，`<tool_call>`/`<tool_response>` 包裹开销未计入。
 
 后果：日志里显示还没超，真实请求可能已经超限；截断后依然可能被模型 API 返回 400。
 
