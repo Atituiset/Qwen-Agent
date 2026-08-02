@@ -385,6 +385,22 @@ patch.apply_patch(enable_tool_result_cap=True)
 - 建议同步调大 `QWEN_AGENT_DEFAULT_MAX_INPUT_TOKENS`（或 `generate_cfg.max_input_tokens`），按模型真实上下文留余量，例如 128k 上下文的模型设 100k-110k。
 - 如果生产 agent 是自定义类且**重写了 `_call_tool` 但不调用 `super()._call_tool`**，"工具结果源头限流"这一项不会生效（截断与计数修正不受影响）；此时需要在自定义 `_call_tool` 里自行调用 `qwen_agent_truncation_monkeypatch._cap_tool_result(result, TOOL_RESULT_MAX_TOKENS)`。
 
+### 8.7 回归测试
+
+仓库里固化了一套自包含回归测试（真实 tiktoken + pydantic v2 Message 复刻，不依赖
+numpy/openai/mcp 等完整依赖），覆盖 13 组用例 + 30 组随机压力对话：预算恒成立、
+首轮任务保留、functions 开销扣减、reasoning 计数与截断、入口校验、字段保留、
+工具结果限流等：
+
+```bash
+pytest tests/examples/test_truncation_monkeypatch.py
+# 或无需 pytest：
+python tests/examples/test_truncation_monkeypatch.py
+```
+
+升级 qwen_agent 后跑一遍即可回归。注意：如果同进程已真实导入 qwen_agent（例如跑
+全量测试套件），该文件会自动跳过（桩注入与真实验会互相污染），建议单独运行。
+
 ## 9. 验证结果（用仓库 tokenizer 实测）
 
 对补丁模块做完整加载测试（桩掉 qwen_agent 依赖后 import，走真实 `_truncate_input_messages_roughly`，`max_tokens=58000`、`SAFETY_MARGIN_TOKENS=512`）：10 组场景 + 30 组随机压力对话，全部满足"非 system 消息 ≤ available"且首轮任务保留。
