@@ -308,29 +308,75 @@ def _truncate_input_messages_roughly(messages, max_tokens):
 
 ## 8. 生产使用方式
 
+### 8.1 直接 import 即生效
+
+补丁模块底部自带 `apply_patch()`，`import` 时会自动完成三处挂接（替换截断函数、包装
+`chat` 透传 functions、包装 `Agent._call_tool` 限流工具结果），并且幂等——重复 import
+不会重复打补丁。
+
+```python
+# 入口文件（app.py / server.py 等）最顶部，任何 agent 创建之前
+import qwen_agent_truncation_monkeypatch
+
+from qwen_agent.agents import FnCallAgent
+agent = FnCallAgent(...)
+```
+
+前提是 patch 文件在入口脚本同目录、或所在目录已在 `sys.path` 里。如果不在：
+
+```python
+import sys, os
+sys.path.insert(0, "/部署路径/containing/patch")
+import qwen_agent_truncation_monkeypatch
+```
+
+### 8.2 每个进程都要 import 一次
+
+如果生产是 gunicorn/多进程 worker、或通过 subprocess 起的独立服务，**每个 worker 进程
+都必须执行一次这个 import**。只在主进程 import 不会自动覆盖子进程。
+
+### 8.3 确认生效
+
+import 后应看到日志：
+
+```
+qwen_agent_truncation_monkeypatch applied: tool_result_max_tokens=24000, safety_margin=512
+```
+
+也可以用一行代码验证：
+
+```python
+import qwen_agent.llm.base as b
+assert b._truncate_input_messages_roughly.__module__ == 'qwen_agent_truncation_monkeypatch'
+```
+
+### 8.4 环境变量
+
 ```bash
 # 可选：环境变量覆盖默认值
 export QWEN_PATCH_TOOL_RESULT_MAX_TOKENS=30000
 export QWEN_PATCH_SAFETY_MARGIN_TOKENS=512
 ```
 
-把 `qwen_agent_truncation_monkeypatch.py` 放到项目可 import 的路径，在**创建 agent / LLM 之前**：
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `QWEN_PATCH_TOOL_RESULT_MAX_TOKENS` | 24000 | 单次工具结果上限，超了保留头尾 + 省略标记 |
+| `QWEN_PATCH_SAFETY_MARGIN_TOKENS` | 512 | 为聊天模板/角色标记预留的余量 |
+| `QWEN_AGENT_DEFAULT_MAX_INPUT_TOKENS` | 58000 | 截断预算（框架自带），建议按模型上下文调大 |
 
-```python
-import qwen_agent_truncation_monkeypatch  # import 即 apply_patch()
-
-from qwen_agent.agents import FnCallAgent
-agent = FnCallAgent(...)
-```
-
-显式控制：
+### 8.5 显式控制（可选）
 
 ```python
 import qwen_agent_truncation_monkeypatch as patch
 patch.apply_patch(enable_tool_result_cap=True)
 ```
 
-建议同步调大 `QWEN_AGENT_DEFAULT_MAX_INPUT_TOKENS`（或 `generate_cfg.max_input_tokens`），按模型真实上下文留余量，例如 128k 上下文的模型设 100k-110k。
+如果业务代码不想 import 时自动打补丁，可以去掉文件末尾的 `apply_patch()` 行，改为在合适时机显式调用。
+
+### 8.6 注意事项
+
+- 建议同步调大 `QWEN_AGENT_DEFAULT_MAX_INPUT_TOKENS`（或 `generate_cfg.max_input_tokens`），按模型真实上下文留余量，例如 128k 上下文的模型设 100k-110k。
+- 如果生产 agent 是自定义类且**重写了 `_call_tool` 但不调用 `super()._call_tool`**，"工具结果源头限流"这一项不会生效（截断与计数修正不受影响）；此时需要在自定义 `_call_tool` 里自行调用 `qwen_agent_truncation_monkeypatch._cap_tool_result(result, TOOL_RESULT_MAX_TOKENS)`。
 
 ## 9. 验证结果（用仓库 tokenizer 实测）
 
