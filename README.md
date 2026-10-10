@@ -16,6 +16,8 @@ limitations under the License.
 
 [中文](https://github.com/QwenLM/Qwen-Agent/blob/main/README_CN.md) ｜ English
 
+> 📖 框架深度解析（本 fork 自建中文文档，GitHub Pages）：<https://atituiset.github.io/Qwen-Agent/>
+
 <p align="center">
     <img src="https://qianwen-res.oss-accelerate-overseas.aliyuncs.com/logo_qwen_agent.png" width="400"/>
 <p>
