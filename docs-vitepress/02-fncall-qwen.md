@@ -81,7 +81,7 @@ function_choice != 'auto'/'none' → 在 last user message 后追加
 - `✿` Unicode 在不支持该 token 的 tokenizer 上会分解为多 token，模型可能根本识别不出标记
 - `function_choice` 只强引导 name 不强引导 arguments；模型输出 `✿FUNCTION✿: get_weather` 后照样可能错参数
 - 用 Qwen 模板时**不支持**Code Interpreter code 提外层 path —— 代码全塞 JSON arguments 转义
-- 模板 prompt 中教的"图片需要渲染为 ![](url)" 是中文场景特别强引导，模型偶发把 tool result 当图像 url
+- 模板 prompt 中教的"图片需要渲染为 `![](url)`" 是中文场景特别强引导，模型偶发把 tool result 当图像 url
 - `remove_incomplete_special_tokens` 移除半截 `✿` 字符，**若模型生成的 tool name 包含 ✿** 会破坏 prompt
 - `parallel_function_calls=False` 但模型仍并行输出 → postprocess 仍按 parallel 路径处理（无强约束），caller 要警觉
 - Qwen3-Coder + vLLM 0.6+ 原生支持 OpenAI tool_calls 字段时可以**完全跳过 Qwen 模板**走 OAI 直连——Qwen 文本模板是兼容层，不是性能路径

@@ -1,11 +1,11 @@
-name: Deploy Docs Book to GitHub Pages
+name: Deploy Docs to GitHub Pages
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'docs-book/**'
+      - 'docs-vitepress/**'
   workflow_dispatch:
 
 permissions:
@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages-docs-book"
+  group: "pages-docs-vitepress"
   cancel-in-progress: false
 
 jobs:
@@ -24,20 +24,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install mdBook
-        run: |
-          mkdir -p ~/.cargo/bin
-          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar -xz --directory=$HOME/.cargo/bin
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
-      - name: Build mdBook
-        run: mdbook build
-        working-directory: docs-book
+      - name: Install dependencies
+        run: npm ci --prefix docs-vitepress
+
+      - name: Build VitePress site
+        run: npm run docs:build --prefix docs-vitepress
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs-book/book
+          path: docs-vitepress/.vitepress/dist
 
   deploy:
     environment:

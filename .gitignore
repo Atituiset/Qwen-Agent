@@ -65,5 +65,7 @@ qwen-agent-docs/website/last-sync.json
 qwen-agent-docs/website/_pagefind/
 qwen-agent-docs/website/*.tsbuildinfo
 
-# mdBook build output
-docs-book/book/
+# VitePress build output
+docs-vitepress/.vitepress/dist
+docs-vitepress/.vitepress/cache
+docs-vitepress/node_modules/
